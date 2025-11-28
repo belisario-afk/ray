@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.4")]
+    [Info("RayGun", "YourNameHere", "3.0.5")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -93,6 +93,11 @@ namespace Oxide.Plugins
         // Cached StringPool values to avoid repeated lookups
         private uint _fleshMaterialId;
         private uint _spineBoneId;
+
+        // Fallback muzzle offset constants (used when weapon muzzle point is unavailable)
+        private const float MuzzleOffsetForward = 0.5f;
+        private const float MuzzleOffsetDown = 0.15f;
+        private const float MuzzleOffsetRight = 0.1f;
 
         #endregion
 
@@ -232,8 +237,8 @@ namespace Oxide.Plugins
         {
             if (attacker == null) return;
 
-            // Simplified, more typical origin/forward
-            Vector3 origin = attacker.eyes != null
+            // Get eye position for raycast origin (accurate aiming)
+            Vector3 eyePos = attacker.eyes != null
                 ? attacker.eyes.position
                 : attacker.transform.position;
 
@@ -241,12 +246,15 @@ namespace Oxide.Plugins
                 ? attacker.eyes.BodyForward()
                 : attacker.transform.forward;
 
+            // Calculate muzzle position from the held weapon for visual effects
+            Vector3 muzzlePos = GetMuzzlePosition(attacker, eyePos, forward);
+
             RaycastHit hit;
             BaseEntity hitEntity = null;
-            Vector3 hitPoint = origin + forward * _config.MaxRange;
+            Vector3 hitPoint = eyePos + forward * _config.MaxRange;
             Vector3 hitNormal = -forward;
 
-            bool didHit = Physics.Raycast(origin, forward, out hit, _config.MaxRange, _rayMask,
+            bool didHit = Physics.Raycast(eyePos, forward, out hit, _config.MaxRange, _rayMask,
                 QueryTriggerInteraction.Ignore);
 
             if (didHit)
@@ -263,13 +271,35 @@ namespace Oxide.Plugins
                 didDamage = ApplyDamageViaHitInfo(hitEntity, attacker, hitPoint, hitNormal);
             }
 
-            PlayMuzzleFx(origin, forward);
-            PlayTracerFx(origin, hitPoint);
+            // Use muzzle position for visual effects so they appear at the gun barrel
+            PlayMuzzleFx(muzzlePos, forward);
+            PlayTracerFx(muzzlePos, hitPoint);
             if (didHit)
                 PlayImpactFx(hitPoint, hitNormal);
 
             if (didDamage)
                 PlayHitmarker(attacker);
+        }
+
+        /// <summary>
+        /// Gets the muzzle position from the player's held weapon for visual effects.
+        /// Falls back to a position in front of the player if weapon muzzle can't be found.
+        /// </summary>
+        private Vector3 GetMuzzlePosition(BasePlayer player, Vector3 eyePos, Vector3 forward)
+        {
+            var heldEntity = player.GetActiveItem()?.GetHeldEntity();
+            
+            // Try to get the muzzle point from BaseProjectile weapons (includes water pistol)
+            // MuzzlePoint may be null for some weapon types or configurations
+            if (heldEntity is BaseProjectile projectile && projectile.MuzzlePoint != null)
+            {
+                return projectile.MuzzlePoint.position;
+            }
+
+            // Fallback: position slightly in front and below eye level (approximate gun position)
+            // This places effects roughly where a held pistol would be
+            Vector3 right = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+            return eyePos + forward * MuzzleOffsetForward - Vector3.up * MuzzleOffsetDown + right * MuzzleOffsetRight;
         }
 
         /// <summary>
