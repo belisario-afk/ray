@@ -1,10 +1,11 @@
 using System;
 using System.Collections.Generic;
+using Newtonsoft.Json;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.3")]
+    [Info("RayGun", "YourNameHere", "3.0.4")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -14,32 +15,44 @@ namespace Oxide.Plugins
 
         public class RayGunConfig
         {
+            [JsonProperty("Enabled")]
             public bool Enabled = true;
 
             // Which item acts as the RayGun
+            [JsonProperty("ItemShortname")]
             public string ItemShortname = "pistol.water";
 
             // If empty, all skins for that item are allowed.
+            [JsonProperty("AllowedSkins")]
             public List<ulong> AllowedSkins = new List<ulong>();
 
             // RayGun behaviour
+            [JsonProperty("MaxRange")]
             public float MaxRange = 100f;      // how far the ray goes
+            [JsonProperty("Damage")]
             public float Damage = 25f;         // damage per hit
+            [JsonProperty("FireRate")]
             public float FireRate = 8f;        // shots per second per player
 
             // EMPTY = no permission required (everyone can use)
+            [JsonProperty("PermissionName")]
             public string PermissionName = "";
 
             // FX paths (your requested ones)
+            [JsonProperty("MuzzleFxPrefab")]
             public string MuzzleFxPrefab = "assets/content/effects/muzzleflashes/other/muzzle_flash_silencer_oilfilter.prefab";
+            [JsonProperty("TracerFxPrefab")]
             public string TracerFxPrefab = "assets/prefabs/weapons/eoka pistol/effects/flint_spark.prefab";
+            [JsonProperty("ImpactFxPrefab")]
             public string ImpactFxPrefab = "assets/prefabs/weapons/eoka pistol/effects/flint_spark.prefab";
 
             // Hitmarker settings
+            [JsonProperty("HitmarkerEnabled")]
             public bool HitmarkerEnabled = false;
 
             // Leave empty by default to avoid StringPool errors.
             // Set to a valid sound prefab path on your build to enable audio hitmarkers.
+            [JsonProperty("HitmarkerSound")]
             public string HitmarkerSound = "";
         }
 
@@ -75,7 +88,11 @@ namespace Oxide.Plugins
         private int _rayMask;
 
         // Default damage type – this will be put into HitInfo and go through standard pipeline.
-        private Rust.DamageType _damageType = Rust.DamageType.Bullet;
+        private const Rust.DamageType DamageType = Rust.DamageType.Bullet;
+
+        // Cached StringPool values to avoid repeated lookups
+        private uint _fleshMaterialId;
+        private uint _spineBoneId;
 
         #endregion
 
@@ -83,9 +100,14 @@ namespace Oxide.Plugins
 
         private void Init()
         {
-            LoadConfig();
             SetupPermission();
 
+            if (_config.MaxRange <= 0f) _config.MaxRange = 100f;
+            if (_config.FireRate <= 0f) _config.FireRate = 5f;
+        }
+
+        private void OnServerInitialized()
+        {
             // Updated ray mask: includes players + NPCs + usual world stuff
             _rayMask = LayerMask.GetMask(
                 "Default",
@@ -97,14 +119,25 @@ namespace Oxide.Plugins
                 "Tree",
                 "Water",
                 "AI",
-                "Player (Server)",
-                "NPC"
+                "Player (Server)"
             );
 
-            if (_config.MaxRange <= 0f) _config.MaxRange = 100f;
-            if (_config.FireRate <= 0f) _config.FireRate = 5f;
+            // Cache StringPool values after server is initialized
+            _fleshMaterialId = StringPool.Get("Flesh");
+            _spineBoneId = StringPool.Get("spine1");
 
-            PrintWarning("[RayGun] Loaded. Hold pistol.water and fire – hitscan RayGun using Hurt + HitInfo/OnAttacked.");
+            Puts("[RayGun] Loaded. Hold pistol.water and fire – hitscan RayGun using Hurt + HitInfo/OnAttacked.");
+        }
+
+        private void Unload()
+        {
+            _lastShotTime.Clear();
+        }
+
+        private void OnPlayerDisconnected(BasePlayer player, string reason)
+        {
+            if (player != null)
+                _lastShotTime.Remove(player.userID);
         }
 
         private void SetupPermission()
@@ -221,19 +254,6 @@ namespace Oxide.Plugins
                 hitPoint = hit.point;
                 hitNormal = hit.normal;
                 hitEntity = hit.GetEntity();
-
-                if (hitEntity != null)
-                {
-                    PrintWarning($"[RayGun] Raycast hit entity: {hitEntity.ShortPrefabName} ({hitEntity.GetType().Name}) at {hitPoint}");
-                }
-                else
-                {
-                    PrintWarning("[RayGun] Raycast hit something with no BaseEntity");
-                }
-            }
-            else
-            {
-                PrintWarning("[RayGun] Raycast did not hit anything");
             }
 
             bool didDamage = false;
@@ -258,7 +278,7 @@ namespace Oxide.Plugins
         /// </summary>
         private bool ApplyDamageViaHitInfo(BaseEntity entity, BasePlayer attacker, Vector3 hitPoint, Vector3 hitNormal)
         {
-            if (entity == null || attacker == null) return false;
+            if (entity == null || entity.IsDestroyed || attacker == null) return false;
 
             float dmg = Mathf.Max(0f, _config.Damage);
             if (dmg <= 0f) return false;
@@ -268,60 +288,44 @@ namespace Oxide.Plugins
                 var held = attacker.GetActiveItem()?.GetHeldEntity() as AttackEntity;
                 var bce = entity as BaseCombatEntity;
 
-                PrintWarning($"[RayGun] ApplyDamageViaHitInfo -> target={entity.ShortPrefabName}, type={entity.GetType().Name}, dmg={dmg}");
-
                 // 1) Direct Hurt (this actually changes HP)
                 if (bce != null && !bce.IsDestroyed)
                 {
-                    float before = bce.Health();
-                    bce.Hurt(dmg, _damageType, attacker);
-                    float after = bce.Health();
-                    PrintWarning($"[RayGun] Hurt: {bce.ShortPrefabName} HP {before} -> {after}");
-                }
-                else
-                {
-                    PrintWarning($"[RayGun] Target is not BaseCombatEntity: {entity.ShortPrefabName} ({entity.GetType().Name})");
+                    bce.Hurt(dmg, DamageType, attacker);
                 }
 
                 // 2) Build HitInfo and call OnAttacked
-                var hitInfo = new HitInfo(attacker, entity, _damageType, dmg)
+                Vector3 pointStart = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
+                Vector3 hitDirection = (hitPoint - pointStart);
+                float projectileDistance = hitDirection.magnitude;
+                var hitInfo = new HitInfo(attacker, entity, DamageType, dmg)
                 {
                     Weapon = held,
-                    HitMaterial = StringPool.Get("Flesh"), // general default; Rust doesn’t enforce this hard
-                    DoHitEffects = true
+                    HitMaterial = _fleshMaterialId,
+                    DoHitEffects = true,
+                    HitPositionWorld = hitPoint,
+                    HitNormalWorld = hitNormal,
+                    PointStart = pointStart,
+                    ProjectileID = 0,
+                    ProjectileDistance = projectileDistance,
+                    ProjectileVelocity = (projectileDistance > 0.001f ? hitDirection / projectileDistance : Vector3.forward) * 250f
                 };
-
-                hitInfo.HitPositionWorld = hitPoint;
-                hitInfo.HitNormalWorld = hitNormal;
-                hitInfo.PointStart = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
-                hitInfo.ProjectileID = 0;
-                hitInfo.ProjectileDistance = Vector3.Distance(hitInfo.PointStart, hitPoint);
-                hitInfo.ProjectileVelocity = (hitPoint - hitInfo.PointStart).normalized * 250f;
 
                 // Give it a reasonable bone/area so head/body plugins see it like a normal hit
                 if (bce != null)
                 {
                     hitInfo.boneArea = HitArea.Torso;
-                    hitInfo.HitBone = StringPool.Get("spine1");
+                    hitInfo.HitBone = _spineBoneId;
                 }
 
                 entity.OnAttacked(hitInfo);
-
-                if (bce != null)
-                {
-                    PrintWarning($"[RayGun] Hurt+OnAttacked: {bce.ShortPrefabName}, health now {bce.Health()}");
-                }
-                else
-                {
-                    PrintWarning($"[RayGun] Hurt+OnAttacked: non-combat {entity.ShortPrefabName}");
-                }
 
                 // didDamage only true if we hit something damageable
                 return bce != null;
             }
             catch (Exception e)
             {
-                PrintWarning($"[RayGun] Failed to apply damage to {entity.ShortPrefabName}: {e.Message}");
+                PrintError($"[RayGun] Failed to apply damage to {entity.ShortPrefabName}: {e.Message}");
                 return false;
             }
         }
@@ -334,64 +338,35 @@ namespace Oxide.Plugins
         {
             if (string.IsNullOrEmpty(_config.MuzzleFxPrefab)) return;
 
-            try
-            {
-                Effect.server.Run(_config.MuzzleFxPrefab, position, forward);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play Muzzle FX '{_config.MuzzleFxPrefab}': {e.Message}");
-            }
+            Effect.server.Run(_config.MuzzleFxPrefab, position, forward);
         }
 
         private void PlayTracerFx(Vector3 origin, Vector3 hitPoint)
         {
             if (string.IsNullOrEmpty(_config.TracerFxPrefab)) return;
 
-            try
-            {
-                Vector3 direction = (hitPoint - origin).normalized;
-                Effect.server.Run(_config.TracerFxPrefab, origin, direction);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play Tracer FX '{_config.TracerFxPrefab}': {e.Message}");
-            }
+            Vector3 direction = (hitPoint - origin).normalized;
+            Effect.server.Run(_config.TracerFxPrefab, origin, direction);
         }
 
         private void PlayImpactFx(Vector3 position, Vector3 normal)
         {
             if (string.IsNullOrEmpty(_config.ImpactFxPrefab)) return;
 
-            try
-            {
-                Vector3 forward = normal.sqrMagnitude > 0.001f ? normal.normalized : Vector3.up;
-                Effect.server.Run(_config.ImpactFxPrefab, position, forward);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play Impact FX '{_config.ImpactFxPrefab}': {e.Message}");
-            }
+            Vector3 forward = normal.sqrMagnitude > 0.001f ? normal.normalized : Vector3.up;
+            Effect.server.Run(_config.ImpactFxPrefab, position, forward);
         }
 
         private void PlayHitmarker(BasePlayer attacker)
         {
-            if (!_config.HitmarkerEnabled) return;
-            if (attacker == null) return;
-            if (string.IsNullOrEmpty(_config.HitmarkerSound)) return;
+            if (!_config.HitmarkerEnabled || attacker == null || string.IsNullOrEmpty(_config.HitmarkerSound))
+                return;
 
-            try
-            {
-                var conn = attacker.net?.connection;
-                if (conn == null) return;
+            var conn = attacker.net?.connection;
+            if (conn == null) return;
 
-                Vector3 pos = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
-                Effect.server.Run(_config.HitmarkerSound, pos, Vector3.up, conn);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play hitmarker sound '{_config.HitmarkerSound}': {e.Message}");
-            }
+            Vector3 pos = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
+            Effect.server.Run(_config.HitmarkerSound, pos, Vector3.up, conn);
         }
 
         #endregion
