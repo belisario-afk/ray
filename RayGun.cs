@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.5")]
+    [Info("RayGun", "YourNameHere", "3.0.6")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -41,10 +41,20 @@ namespace Oxide.Plugins
             // FX paths (your requested ones)
             [JsonProperty("MuzzleFxPrefab")]
             public string MuzzleFxPrefab = "assets/content/effects/muzzleflashes/other/muzzle_flash_silencer_oilfilter.prefab";
-            [JsonProperty("TracerFxPrefab")]
-            public string TracerFxPrefab = "assets/prefabs/weapons/eoka pistol/effects/flint_spark.prefab";
             [JsonProperty("ImpactFxPrefab")]
             public string ImpactFxPrefab = "assets/prefabs/weapons/eoka pistol/effects/flint_spark.prefab";
+
+            // Beam/Tracer settings - colored ray gun beam line
+            [JsonProperty("BeamEnabled")]
+            public bool BeamEnabled = true;
+            [JsonProperty("BeamColorR")]
+            public float BeamColorR = 0f;        // Red component (0-1)
+            [JsonProperty("BeamColorG")]
+            public float BeamColorG = 1f;        // Green component (0-1)
+            [JsonProperty("BeamColorB")]
+            public float BeamColorB = 0f;        // Blue component (0-1)
+            [JsonProperty("BeamDuration")]
+            public float BeamDuration = 0.15f;   // How long the beam is visible (seconds)
 
             // Hitmarker settings
             [JsonProperty("HitmarkerEnabled")]
@@ -273,7 +283,7 @@ namespace Oxide.Plugins
 
             // Use muzzle position for visual effects so they appear at the gun barrel
             PlayMuzzleFx(muzzlePos, forward);
-            PlayTracerFx(muzzlePos, hitPoint);
+            PlayBeamTracer(muzzlePos, hitPoint);
             if (didHit)
                 PlayImpactFx(hitPoint, hitNormal);
 
@@ -370,12 +380,34 @@ namespace Oxide.Plugins
             Effect.server.Run(_config.MuzzleFxPrefab, position, forward);
         }
 
-        private void PlayTracerFx(Vector3 origin, Vector3 hitPoint)
+        /// <summary>
+        /// Draws a visible colored beam line from origin to hitPoint using DDraw.
+        /// This creates the ray gun laser beam effect visible to all nearby players.
+        /// </summary>
+        private void PlayBeamTracer(Vector3 origin, Vector3 hitPoint)
         {
-            if (string.IsNullOrEmpty(_config.TracerFxPrefab)) return;
+            if (!_config.BeamEnabled) return;
 
-            Vector3 direction = (hitPoint - origin).normalized;
-            Effect.server.Run(_config.TracerFxPrefab, origin, direction);
+            Color beamColor = new Color(
+                Mathf.Clamp01(_config.BeamColorR),
+                Mathf.Clamp01(_config.BeamColorG),
+                Mathf.Clamp01(_config.BeamColorB),
+                1f
+            );
+
+            float duration = Mathf.Max(0.05f, _config.BeamDuration);
+
+            // Draw the beam line visible to all players
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (player == null || player.net?.connection == null) continue;
+
+                // Only send to players within reasonable distance to optimize network traffic
+                float distSqr = (player.transform.position - origin).sqrMagnitude;
+                if (distSqr > 22500f) continue; // 150m radius
+
+                player.SendConsoleCommand("ddraw.line", duration, beamColor, origin, hitPoint);
+            }
         }
 
         private void PlayImpactFx(Vector3 position, Vector3 normal)
@@ -428,6 +460,10 @@ namespace Oxide.Plugins
                 ? "(none / disabled)"
                 : $"'{_config.HitmarkerSound}'";
 
+            string beamInfo = _config.BeamEnabled 
+                ? $"ON (R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}, {_config.BeamDuration:F2}s)"
+                : "OFF";
+
             player.ChatMessage(
                 "RayGun Info:\n" +
                 $"- Enabled: {(_config.Enabled ? "YES" : "NO")}\n" +
@@ -438,7 +474,7 @@ namespace Oxide.Plugins
                 $"- Permission: {permission}\n" +
                 $"- Hitmarker: {hitmarkerState} (sound: {hitmarkerSound})\n" +
                 $"- MuzzleFx: '{_config.MuzzleFxPrefab}'\n" +
-                $"- TracerFx: '{_config.TracerFxPrefab}'\n" +
+                $"- Beam: {beamInfo}\n" +
                 $"- ImpactFx: '{_config.ImpactFxPrefab}'"
             );
         }
