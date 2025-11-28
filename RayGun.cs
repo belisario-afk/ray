@@ -311,10 +311,9 @@ namespace Oxide.Plugins
                     ProjectileVelocity = (projectileDistance > 0.001f ? hitDirection / projectileDistance : Vector3.forward) * 250f
                 };
 
-                // Give it a reasonable bone/area so head/body plugins see it like a normal hit
+                // Give it a reasonable bone so head/body plugins see it like a normal hit
                 if (bce != null)
                 {
-                    hitInfo.boneArea = HitArea.Torso;
                     hitInfo.HitBone = _spineBoneId;
                 }
 
