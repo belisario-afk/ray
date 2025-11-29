@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.8")]
+    [Info("RayGun", "YourNameHere", "3.0.9")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -63,6 +63,10 @@ namespace Oxide.Plugins
             public string ProjectilePrefab = "assets/prefabs/weapons/toolgun/effects/ringeffect_realistic.prefab";
             [JsonProperty("ProjectileSpeed")]
             public float ProjectileSpeed = 150f;  // Speed of the traveling projectile (m/s)
+            [JsonProperty("ProjectileCount")]
+            public int ProjectileCount = 5;       // Number of ring effects to spawn (1-20)
+            [JsonProperty("ProjectileOffsetZ")]
+            public float ProjectileOffsetZ = 0f;  // Forward/Back offset for projectile start position
 
             // Muzzle position offset adjustments (for fine-tuning where effects originate)
             [JsonProperty("MuzzleOffsetX")]
@@ -496,15 +500,19 @@ namespace Oxide.Plugins
             if (distance < 0.1f) return;
 
             direction = direction.normalized;
+            
+            // Apply projectile-specific Z offset
+            Vector3 projectileOrigin = origin + direction * _config.ProjectileOffsetZ;
+            
             float speed = Mathf.Max(50f, _config.ProjectileSpeed);
             float travelTime = distance / speed;
-            int steps = Mathf.Max(1, Mathf.CeilToInt(travelTime / EffectIntervalSeconds)); // Effect every 50ms
+            int steps = Mathf.Clamp(_config.ProjectileCount, 1, 20); // Use configurable count (1-20)
 
             // Spawn effects along the path with delays to create traveling appearance
             for (int i = 0; i <= steps; i++)
             {
                 float t = (float)i / steps;
-                Vector3 pos = Vector3.Lerp(origin, hitPoint, t);
+                Vector3 pos = Vector3.Lerp(projectileOrigin, hitPoint, t);
                 float delay = t * travelTime;
 
                 timer.Once(delay, () =>
@@ -570,7 +578,7 @@ namespace Oxide.Plugins
                 : "OFF";
 
             string projectileInfo = _config.ProjectileEnabled
-                ? $"ON (Speed: {_config.ProjectileSpeed:F0})"
+                ? $"ON (Speed:{_config.ProjectileSpeed:F0}, Count:{_config.ProjectileCount}, Offset:{_config.ProjectileOffsetZ:F2})"
                 : "OFF";
 
             string offsetInfo = $"X:{_config.MuzzleOffsetX:F2} Y:{_config.MuzzleOffsetY:F2} Z:{_config.MuzzleOffsetZ:F2}";
@@ -888,10 +896,14 @@ namespace Oxide.Plugins
                     "RayGun Projectile Settings:\n" +
                     $"Enabled: {_config.ProjectileEnabled}\n" +
                     $"Speed: {_config.ProjectileSpeed:F0} m/s\n" +
+                    $"Count: {_config.ProjectileCount} rings\n" +
+                    $"Offset Z: {_config.ProjectileOffsetZ:F2}\n" +
                     $"Prefab: '{_config.ProjectilePrefab}'\n" +
                     "Commands:\n" +
                     "  /raygun.projectile toggle - Toggle projectile effect on/off\n" +
-                    "  /raygun.projectile speed <value> - Set projectile speed (m/s)"
+                    "  /raygun.projectile speed <value> - Set projectile speed (m/s)\n" +
+                    "  /raygun.projectile count <1-20> - Set number of ring effects\n" +
+                    "  /raygun.projectile offset <value> - Set Z offset (negative = back)"
                 );
                 return;
             }
@@ -915,6 +927,28 @@ namespace Oxide.Plugins
                     }
                     else
                         player.ChatMessage("Usage: /raygun.projectile speed <value>");
+                    break;
+
+                case "count":
+                    if (args.Length >= 2 && int.TryParse(args[1], out int cnt))
+                    {
+                        _config.ProjectileCount = Mathf.Clamp(cnt, 1, 20);
+                        SaveConfig();
+                        player.ChatMessage($"Projectile count set to {_config.ProjectileCount} rings (more spread out)");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.projectile count <1-20>");
+                    break;
+
+                case "offset":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float off))
+                    {
+                        _config.ProjectileOffsetZ = off;
+                        SaveConfig();
+                        player.ChatMessage($"Projectile Z offset set to {_config.ProjectileOffsetZ:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.projectile offset <value>");
                     break;
 
                 default:
