@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.6")]
+    [Info("RayGun", "YourNameHere", "3.0.7")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -56,6 +56,22 @@ namespace Oxide.Plugins
             [JsonProperty("BeamDuration")]
             public float BeamDuration = 0.15f;   // How long the beam is visible (seconds)
 
+            // Projectile ring effect settings - traveling visual projectile
+            [JsonProperty("ProjectileEnabled")]
+            public bool ProjectileEnabled = true;
+            [JsonProperty("ProjectilePrefab")]
+            public string ProjectilePrefab = "assets/prefabs/weapons/toolgun/effects/ringeffect_realistic.prefab";
+            [JsonProperty("ProjectileSpeed")]
+            public float ProjectileSpeed = 150f;  // Speed of the traveling projectile (m/s)
+
+            // Muzzle position offset adjustments (for fine-tuning where effects originate)
+            [JsonProperty("MuzzleOffsetX")]
+            public float MuzzleOffsetX = 0f;     // Right/Left offset
+            [JsonProperty("MuzzleOffsetY")]
+            public float MuzzleOffsetY = 0f;     // Up/Down offset
+            [JsonProperty("MuzzleOffsetZ")]
+            public float MuzzleOffsetZ = 0f;     // Forward/Back offset
+
             // Hitmarker settings
             [JsonProperty("HitmarkerEnabled")]
             public bool HitmarkerEnabled = false;
@@ -99,6 +115,12 @@ namespace Oxide.Plugins
 
         // Default damage type – this will be put into HitInfo and go through standard pipeline.
         private const Rust.DamageType DamageType = Rust.DamageType.Bullet;
+
+        // Effect interval for projectile spawning (seconds between effect spawns)
+        private const float EffectIntervalSeconds = 0.05f;
+
+        // Offset step size for D-pad style adjustment commands
+        private const float OffsetStepSize = 0.05f;
 
         // Cached StringPool values to avoid repeated lookups
         private uint _fleshMaterialId;
@@ -284,6 +306,7 @@ namespace Oxide.Plugins
             // Use muzzle position for visual effects so they appear at the gun barrel
             PlayMuzzleFx(muzzlePos, forward);
             PlayBeamTracer(muzzlePos, hitPoint);
+            PlayProjectileEffect(attacker, muzzlePos, hitPoint);
             if (didHit)
                 PlayImpactFx(hitPoint, hitNormal);
 
@@ -294,22 +317,36 @@ namespace Oxide.Plugins
         /// <summary>
         /// Gets the muzzle position from the player's held weapon for visual effects.
         /// Falls back to a position in front of the player if weapon muzzle can't be found.
+        /// Applies configurable offset adjustments for fine-tuning.
         /// </summary>
         private Vector3 GetMuzzlePosition(BasePlayer player, Vector3 eyePos, Vector3 forward)
         {
+            Vector3 basePos;
             var heldEntity = player.GetActiveItem()?.GetHeldEntity();
             
             // Try to get the muzzle point from BaseProjectile weapons (includes water pistol)
             // MuzzlePoint may be null for some weapon types or configurations
             if (heldEntity is BaseProjectile projectile && projectile.MuzzlePoint != null)
             {
-                return projectile.MuzzlePoint.position;
+                basePos = projectile.MuzzlePoint.position;
+            }
+            else
+            {
+                // Fallback: position slightly in front and below eye level (approximate gun position)
+                // This places effects roughly where a held pistol would be
+                Vector3 right = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+                basePos = eyePos + forward * MuzzleOffsetForward - Vector3.up * MuzzleOffsetDown + right * MuzzleOffsetRight;
             }
 
-            // Fallback: position slightly in front and below eye level (approximate gun position)
-            // This places effects roughly where a held pistol would be
-            Vector3 right = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
-            return eyePos + forward * MuzzleOffsetForward - Vector3.up * MuzzleOffsetDown + right * MuzzleOffsetRight;
+            // Apply configurable offset adjustments
+            Vector3 right2 = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+            Vector3 up = Vector3.up;
+            
+            basePos += right2 * _config.MuzzleOffsetX;
+            basePos += up * _config.MuzzleOffsetY;
+            basePos += forward * _config.MuzzleOffsetZ;
+
+            return basePos;
         }
 
         /// <summary>
@@ -410,6 +447,38 @@ namespace Oxide.Plugins
             }
         }
 
+        /// <summary>
+        /// Creates a traveling projectile effect using the ring effect prefab.
+        /// The effect travels from origin to hitPoint at the configured speed.
+        /// </summary>
+        private void PlayProjectileEffect(BasePlayer attacker, Vector3 origin, Vector3 hitPoint)
+        {
+            if (!_config.ProjectileEnabled || string.IsNullOrEmpty(_config.ProjectilePrefab)) return;
+
+            Vector3 direction = (hitPoint - origin);
+            float distance = direction.magnitude;
+            if (distance < 0.1f) return;
+
+            direction = direction.normalized;
+            float speed = Mathf.Max(50f, _config.ProjectileSpeed);
+            float travelTime = distance / speed;
+            int steps = Mathf.Max(1, Mathf.CeilToInt(travelTime / EffectIntervalSeconds)); // Effect every 50ms
+
+            // Spawn effects along the path with delays to create traveling appearance
+            for (int i = 0; i <= steps; i++)
+            {
+                float t = (float)i / steps;
+                Vector3 pos = Vector3.Lerp(origin, hitPoint, t);
+                float delay = t * travelTime;
+
+                timer.Once(delay, () =>
+                {
+                    if (attacker == null || attacker.IsDestroyed) return;
+                    Effect.server.Run(_config.ProjectilePrefab, pos, direction);
+                });
+            }
+        }
+
         private void PlayImpactFx(Vector3 position, Vector3 normal)
         {
             if (string.IsNullOrEmpty(_config.ImpactFxPrefab)) return;
@@ -464,6 +533,12 @@ namespace Oxide.Plugins
                 ? $"ON (R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}, {_config.BeamDuration:F2}s)"
                 : "OFF";
 
+            string projectileInfo = _config.ProjectileEnabled
+                ? $"ON (Speed: {_config.ProjectileSpeed:F0})"
+                : "OFF";
+
+            string offsetInfo = $"X:{_config.MuzzleOffsetX:F2} Y:{_config.MuzzleOffsetY:F2} Z:{_config.MuzzleOffsetZ:F2}";
+
             player.ChatMessage(
                 "RayGun Info:\n" +
                 $"- Enabled: {(_config.Enabled ? "YES" : "NO")}\n" +
@@ -475,8 +550,246 @@ namespace Oxide.Plugins
                 $"- Hitmarker: {hitmarkerState} (sound: {hitmarkerSound})\n" +
                 $"- MuzzleFx: '{_config.MuzzleFxPrefab}'\n" +
                 $"- Beam: {beamInfo}\n" +
+                $"- Projectile: {projectileInfo}\n" +
+                $"- MuzzleOffset: {offsetInfo}\n" +
                 $"- ImpactFx: '{_config.ImpactFxPrefab}'"
             );
+        }
+
+        [ChatCommand("raygun.offset")]
+        private void CmdRayGunOffset(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Muzzle Offset Adjustment:\n" +
+                    $"Current: X:{_config.MuzzleOffsetX:F2} Y:{_config.MuzzleOffsetY:F2} Z:{_config.MuzzleOffsetZ:F2}\n" +
+                    "Commands:\n" +
+                    "  /raygun.offset x <value> - Set X offset (right/left)\n" +
+                    "  /raygun.offset y <value> - Set Y offset (up/down)\n" +
+                    "  /raygun.offset z <value> - Set Z offset (forward/back)\n" +
+                    "  /raygun.offset reset - Reset all offsets to 0\n" +
+                    "D-Pad Style:\n" +
+                    "  /raygun.offset left - Move X -0.05\n" +
+                    "  /raygun.offset right - Move X +0.05\n" +
+                    "  /raygun.offset up - Move Y +0.05\n" +
+                    "  /raygun.offset down - Move Y -0.05\n" +
+                    "  /raygun.offset forward - Move Z +0.05\n" +
+                    "  /raygun.offset back - Move Z -0.05"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+            float step = OffsetStepSize;
+
+            switch (action)
+            {
+                case "x":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float xVal))
+                    {
+                        _config.MuzzleOffsetX = xVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle X offset set to {_config.MuzzleOffsetX:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.offset x <value>");
+                    break;
+
+                case "y":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float yVal))
+                    {
+                        _config.MuzzleOffsetY = yVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle Y offset set to {_config.MuzzleOffsetY:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.offset y <value>");
+                    break;
+
+                case "z":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float zVal))
+                    {
+                        _config.MuzzleOffsetZ = zVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle Z offset set to {_config.MuzzleOffsetZ:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.offset z <value>");
+                    break;
+
+                case "reset":
+                    _config.MuzzleOffsetX = 0f;
+                    _config.MuzzleOffsetY = 0f;
+                    _config.MuzzleOffsetZ = 0f;
+                    SaveConfig();
+                    player.ChatMessage("Muzzle offsets reset to 0.");
+                    break;
+
+                // D-Pad style adjustments
+                case "left":
+                    _config.MuzzleOffsetX -= step;
+                    SaveConfig();
+                    player.ChatMessage($"X: {_config.MuzzleOffsetX:F2} (moved left)");
+                    break;
+
+                case "right":
+                    _config.MuzzleOffsetX += step;
+                    SaveConfig();
+                    player.ChatMessage($"X: {_config.MuzzleOffsetX:F2} (moved right)");
+                    break;
+
+                case "up":
+                    _config.MuzzleOffsetY += step;
+                    SaveConfig();
+                    player.ChatMessage($"Y: {_config.MuzzleOffsetY:F2} (moved up)");
+                    break;
+
+                case "down":
+                    _config.MuzzleOffsetY -= step;
+                    SaveConfig();
+                    player.ChatMessage($"Y: {_config.MuzzleOffsetY:F2} (moved down)");
+                    break;
+
+                case "forward":
+                    _config.MuzzleOffsetZ += step;
+                    SaveConfig();
+                    player.ChatMessage($"Z: {_config.MuzzleOffsetZ:F2} (moved forward)");
+                    break;
+
+                case "back":
+                    _config.MuzzleOffsetZ -= step;
+                    SaveConfig();
+                    player.ChatMessage($"Z: {_config.MuzzleOffsetZ:F2} (moved back)");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.offset for help.");
+                    break;
+            }
+        }
+
+        [ChatCommand("raygun.beam")]
+        private void CmdRayGunBeam(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Beam Settings:\n" +
+                    $"Enabled: {_config.BeamEnabled}\n" +
+                    $"Color: R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}\n" +
+                    $"Duration: {_config.BeamDuration:F2}s\n" +
+                    "Commands:\n" +
+                    "  /raygun.beam toggle - Toggle beam on/off\n" +
+                    "  /raygun.beam color <r> <g> <b> - Set RGB color (0-1)\n" +
+                    "  /raygun.beam duration <seconds> - Set duration"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+
+            switch (action)
+            {
+                case "toggle":
+                    _config.BeamEnabled = !_config.BeamEnabled;
+                    SaveConfig();
+                    player.ChatMessage($"Beam is now {(_config.BeamEnabled ? "ENABLED" : "DISABLED")}");
+                    break;
+
+                case "color":
+                    if (args.Length >= 4 &&
+                        float.TryParse(args[1], out float r) &&
+                        float.TryParse(args[2], out float g) &&
+                        float.TryParse(args[3], out float b))
+                    {
+                        _config.BeamColorR = Mathf.Clamp01(r);
+                        _config.BeamColorG = Mathf.Clamp01(g);
+                        _config.BeamColorB = Mathf.Clamp01(b);
+                        SaveConfig();
+                        player.ChatMessage($"Beam color set to R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.beam color <r> <g> <b> (values 0-1)");
+                    break;
+
+                case "duration":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float dur))
+                    {
+                        _config.BeamDuration = Mathf.Max(0.05f, dur);
+                        SaveConfig();
+                        player.ChatMessage($"Beam duration set to {_config.BeamDuration:F2}s");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.beam duration <seconds>");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.beam for help.");
+                    break;
+            }
+        }
+
+        [ChatCommand("raygun.projectile")]
+        private void CmdRayGunProjectile(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Projectile Settings:\n" +
+                    $"Enabled: {_config.ProjectileEnabled}\n" +
+                    $"Speed: {_config.ProjectileSpeed:F0} m/s\n" +
+                    $"Prefab: '{_config.ProjectilePrefab}'\n" +
+                    "Commands:\n" +
+                    "  /raygun.projectile toggle - Toggle projectile effect on/off\n" +
+                    "  /raygun.projectile speed <value> - Set projectile speed (m/s)"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+
+            switch (action)
+            {
+                case "toggle":
+                    _config.ProjectileEnabled = !_config.ProjectileEnabled;
+                    SaveConfig();
+                    player.ChatMessage($"Projectile effect is now {(_config.ProjectileEnabled ? "ENABLED" : "DISABLED")}");
+                    break;
+
+                case "speed":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float spd))
+                    {
+                        _config.ProjectileSpeed = Mathf.Max(50f, spd);
+                        SaveConfig();
+                        player.ChatMessage($"Projectile speed set to {_config.ProjectileSpeed:F0} m/s");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.projectile speed <value>");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.projectile for help.");
+                    break;
+            }
         }
 
         #endregion
