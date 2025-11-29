@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.7")]
+    [Info("RayGun", "YourNameHere", "3.0.8")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -71,6 +71,12 @@ namespace Oxide.Plugins
             public float MuzzleOffsetY = 0f;     // Up/Down offset
             [JsonProperty("MuzzleOffsetZ")]
             public float MuzzleOffsetZ = 0f;     // Forward/Back offset
+
+            // Muzzle rotation offset adjustments (for fine-tuning effect direction)
+            [JsonProperty("MuzzleRotationPitch")]
+            public float MuzzleRotationPitch = 0f;  // Up/Down angle (degrees)
+            [JsonProperty("MuzzleRotationYaw")]
+            public float MuzzleRotationYaw = 0f;    // Left/Right angle (degrees)
 
             // Hitmarker settings
             [JsonProperty("HitmarkerEnabled")]
@@ -281,6 +287,9 @@ namespace Oxide.Plugins
             // Calculate muzzle position from the held weapon for visual effects
             Vector3 muzzlePos = GetMuzzlePosition(attacker, eyePos, forward);
 
+            // Apply rotation offset to get the visual effect direction
+            Vector3 effectForward = ApplyRotationOffset(attacker, forward);
+
             RaycastHit hit;
             BaseEntity hitEntity = null;
             Vector3 hitPoint = eyePos + forward * _config.MaxRange;
@@ -303,10 +312,18 @@ namespace Oxide.Plugins
                 didDamage = ApplyDamageViaHitInfo(hitEntity, attacker, hitPoint, hitNormal);
             }
 
-            // Use muzzle position for visual effects so they appear at the gun barrel
-            PlayMuzzleFx(muzzlePos, forward);
-            PlayBeamTracer(muzzlePos, hitPoint);
-            PlayProjectileEffect(attacker, muzzlePos, hitPoint);
+            // Calculate effect hit point based on rotated direction for visuals
+            Vector3 effectHitPoint = muzzlePos + effectForward * Vector3.Distance(muzzlePos, hitPoint);
+            if (didHit)
+            {
+                // If we actually hit something, use the real hit point for impact
+                effectHitPoint = hitPoint;
+            }
+
+            // Use muzzle position and rotated direction for visual effects
+            PlayMuzzleFx(muzzlePos, effectForward);
+            PlayBeamTracer(muzzlePos, effectHitPoint);
+            PlayProjectileEffect(attacker, muzzlePos, effectHitPoint);
             if (didHit)
                 PlayImpactFx(hitPoint, hitNormal);
 
@@ -347,6 +364,25 @@ namespace Oxide.Plugins
             basePos += forward * _config.MuzzleOffsetZ;
 
             return basePos;
+        }
+
+        /// <summary>
+        /// Applies rotation offset (pitch/yaw) to the forward direction for visual effects.
+        /// </summary>
+        private Vector3 ApplyRotationOffset(BasePlayer player, Vector3 forward)
+        {
+            if (_config.MuzzleRotationPitch == 0f && _config.MuzzleRotationYaw == 0f)
+                return forward;
+
+            Vector3 right = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+            Vector3 up = Vector3.up;
+
+            // Apply yaw (left/right rotation around up axis)
+            Quaternion yawRotation = Quaternion.AngleAxis(_config.MuzzleRotationYaw, up);
+            // Apply pitch (up/down rotation around right axis)
+            Quaternion pitchRotation = Quaternion.AngleAxis(_config.MuzzleRotationPitch, right);
+
+            return (yawRotation * pitchRotation * forward).normalized;
         }
 
         /// <summary>
@@ -538,6 +574,7 @@ namespace Oxide.Plugins
                 : "OFF";
 
             string offsetInfo = $"X:{_config.MuzzleOffsetX:F2} Y:{_config.MuzzleOffsetY:F2} Z:{_config.MuzzleOffsetZ:F2}";
+            string rotationInfo = $"Pitch:{_config.MuzzleRotationPitch:F1}° Yaw:{_config.MuzzleRotationYaw:F1}°";
 
             player.ChatMessage(
                 "RayGun Info:\n" +
@@ -552,6 +589,7 @@ namespace Oxide.Plugins
                 $"- Beam: {beamInfo}\n" +
                 $"- Projectile: {projectileInfo}\n" +
                 $"- MuzzleOffset: {offsetInfo}\n" +
+                $"- MuzzleRotation: {rotationInfo}\n" +
                 $"- ImpactFx: '{_config.ImpactFxPrefab}'"
             );
         }
@@ -671,6 +709,99 @@ namespace Oxide.Plugins
 
                 default:
                     player.ChatMessage($"Unknown action '{action}'. Use /raygun.offset for help.");
+                    break;
+            }
+        }
+
+        [ChatCommand("raygun.rotation")]
+        private void CmdRayGunRotation(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            float rotationStep = 5f; // 5 degrees per step
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Muzzle Rotation Adjustment:\n" +
+                    $"Current: Pitch:{_config.MuzzleRotationPitch:F1}° Yaw:{_config.MuzzleRotationYaw:F1}°\n" +
+                    "Commands:\n" +
+                    "  /raygun.rotation pitch <degrees> - Set pitch (up/down angle)\n" +
+                    "  /raygun.rotation yaw <degrees> - Set yaw (left/right angle)\n" +
+                    "  /raygun.rotation reset - Reset all rotations to 0\n" +
+                    "D-Pad Style (5° per step):\n" +
+                    "  /raygun.rotation pitchup - Pitch up +5°\n" +
+                    "  /raygun.rotation pitchdown - Pitch down -5°\n" +
+                    "  /raygun.rotation yawleft - Yaw left -5°\n" +
+                    "  /raygun.rotation yawright - Yaw right +5°"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+
+            switch (action)
+            {
+                case "pitch":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float pitchVal))
+                    {
+                        _config.MuzzleRotationPitch = pitchVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle pitch set to {_config.MuzzleRotationPitch:F1}°");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.rotation pitch <degrees>");
+                    break;
+
+                case "yaw":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float yawVal))
+                    {
+                        _config.MuzzleRotationYaw = yawVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle yaw set to {_config.MuzzleRotationYaw:F1}°");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.rotation yaw <degrees>");
+                    break;
+
+                case "reset":
+                    _config.MuzzleRotationPitch = 0f;
+                    _config.MuzzleRotationYaw = 0f;
+                    SaveConfig();
+                    player.ChatMessage("Muzzle rotations reset to 0.");
+                    break;
+
+                // D-Pad style adjustments
+                case "pitchup":
+                    _config.MuzzleRotationPitch += rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Pitch: {_config.MuzzleRotationPitch:F1}° (tilted up)");
+                    break;
+
+                case "pitchdown":
+                    _config.MuzzleRotationPitch -= rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Pitch: {_config.MuzzleRotationPitch:F1}° (tilted down)");
+                    break;
+
+                case "yawleft":
+                    _config.MuzzleRotationYaw -= rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Yaw: {_config.MuzzleRotationYaw:F1}° (turned left)");
+                    break;
+
+                case "yawright":
+                    _config.MuzzleRotationYaw += rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Yaw: {_config.MuzzleRotationYaw:F1}° (turned right)");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.rotation for help.");
                     break;
             }
         }
