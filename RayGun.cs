@@ -1,10 +1,11 @@
 using System;
 using System.Collections.Generic;
+using Newtonsoft.Json;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RayGun", "YourNameHere", "3.0.3")]
+    [Info("RayGun", "YourNameHere", "3.0.9")]
     [Description("Water pistol RayGun: hitscan damage via Hurt + HitInfo/OnAttacked, with FX and optional hitmarker.")]
     public class RayGun : RustPlugin
     {
@@ -14,32 +15,80 @@ namespace Oxide.Plugins
 
         public class RayGunConfig
         {
+            [JsonProperty("Enabled")]
             public bool Enabled = true;
 
             // Which item acts as the RayGun
+            [JsonProperty("ItemShortname")]
             public string ItemShortname = "pistol.water";
 
             // If empty, all skins for that item are allowed.
+            [JsonProperty("AllowedSkins")]
             public List<ulong> AllowedSkins = new List<ulong>();
 
             // RayGun behaviour
+            [JsonProperty("MaxRange")]
             public float MaxRange = 100f;      // how far the ray goes
+            [JsonProperty("Damage")]
             public float Damage = 25f;         // damage per hit
+            [JsonProperty("FireRate")]
             public float FireRate = 8f;        // shots per second per player
 
             // EMPTY = no permission required (everyone can use)
+            [JsonProperty("PermissionName")]
             public string PermissionName = "";
 
             // FX paths (your requested ones)
+            [JsonProperty("MuzzleFxPrefab")]
             public string MuzzleFxPrefab = "assets/content/effects/muzzleflashes/other/muzzle_flash_silencer_oilfilter.prefab";
-            public string TracerFxPrefab = "assets/prefabs/weapons/eoka pistol/effects/flint_spark.prefab";
+            [JsonProperty("ImpactFxPrefab")]
             public string ImpactFxPrefab = "assets/prefabs/weapons/eoka pistol/effects/flint_spark.prefab";
 
+            // Beam/Tracer settings - colored ray gun beam line
+            [JsonProperty("BeamEnabled")]
+            public bool BeamEnabled = true;
+            [JsonProperty("BeamColorR")]
+            public float BeamColorR = 0f;        // Red component (0-1)
+            [JsonProperty("BeamColorG")]
+            public float BeamColorG = 1f;        // Green component (0-1)
+            [JsonProperty("BeamColorB")]
+            public float BeamColorB = 0f;        // Blue component (0-1)
+            [JsonProperty("BeamDuration")]
+            public float BeamDuration = 0.15f;   // How long the beam is visible (seconds)
+
+            // Projectile ring effect settings - traveling visual projectile
+            [JsonProperty("ProjectileEnabled")]
+            public bool ProjectileEnabled = true;
+            [JsonProperty("ProjectilePrefab")]
+            public string ProjectilePrefab = "assets/prefabs/weapons/toolgun/effects/ringeffect_realistic.prefab";
+            [JsonProperty("ProjectileSpeed")]
+            public float ProjectileSpeed = 150f;  // Speed of the traveling projectile (m/s)
+            [JsonProperty("ProjectileCount")]
+            public int ProjectileCount = 5;       // Number of ring effects to spawn (1-20)
+            [JsonProperty("ProjectileOffsetZ")]
+            public float ProjectileOffsetZ = 0f;  // Forward/Back offset for projectile start position
+
+            // Muzzle position offset adjustments (for fine-tuning where effects originate)
+            [JsonProperty("MuzzleOffsetX")]
+            public float MuzzleOffsetX = 0f;     // Right/Left offset
+            [JsonProperty("MuzzleOffsetY")]
+            public float MuzzleOffsetY = 0f;     // Up/Down offset
+            [JsonProperty("MuzzleOffsetZ")]
+            public float MuzzleOffsetZ = 0f;     // Forward/Back offset
+
+            // Muzzle rotation offset adjustments (for fine-tuning effect direction)
+            [JsonProperty("MuzzleRotationPitch")]
+            public float MuzzleRotationPitch = 0f;  // Up/Down angle (degrees)
+            [JsonProperty("MuzzleRotationYaw")]
+            public float MuzzleRotationYaw = 0f;    // Left/Right angle (degrees)
+
             // Hitmarker settings
+            [JsonProperty("HitmarkerEnabled")]
             public bool HitmarkerEnabled = false;
 
             // Leave empty by default to avoid StringPool errors.
             // Set to a valid sound prefab path on your build to enable audio hitmarkers.
+            [JsonProperty("HitmarkerSound")]
             public string HitmarkerSound = "";
         }
 
@@ -75,7 +124,22 @@ namespace Oxide.Plugins
         private int _rayMask;
 
         // Default damage type – this will be put into HitInfo and go through standard pipeline.
-        private Rust.DamageType _damageType = Rust.DamageType.Bullet;
+        private const Rust.DamageType DamageType = Rust.DamageType.Bullet;
+
+        // Effect interval for projectile spawning (seconds between effect spawns)
+        private const float EffectIntervalSeconds = 0.05f;
+
+        // Offset step size for D-pad style adjustment commands
+        private const float OffsetStepSize = 0.05f;
+
+        // Cached StringPool values to avoid repeated lookups
+        private uint _fleshMaterialId;
+        private uint _spineBoneId;
+
+        // Fallback muzzle offset constants (used when weapon muzzle point is unavailable)
+        private const float MuzzleOffsetForward = 0.5f;
+        private const float MuzzleOffsetDown = 0.15f;
+        private const float MuzzleOffsetRight = 0.1f;
 
         #endregion
 
@@ -83,9 +147,14 @@ namespace Oxide.Plugins
 
         private void Init()
         {
-            LoadConfig();
             SetupPermission();
 
+            if (_config.MaxRange <= 0f) _config.MaxRange = 100f;
+            if (_config.FireRate <= 0f) _config.FireRate = 5f;
+        }
+
+        private void OnServerInitialized()
+        {
             // Updated ray mask: includes players + NPCs + usual world stuff
             _rayMask = LayerMask.GetMask(
                 "Default",
@@ -97,14 +166,25 @@ namespace Oxide.Plugins
                 "Tree",
                 "Water",
                 "AI",
-                "Player (Server)",
-                "NPC"
+                "Player (Server)"
             );
 
-            if (_config.MaxRange <= 0f) _config.MaxRange = 100f;
-            if (_config.FireRate <= 0f) _config.FireRate = 5f;
+            // Cache StringPool values after server is initialized
+            _fleshMaterialId = StringPool.Get("Flesh");
+            _spineBoneId = StringPool.Get("spine1");
 
-            PrintWarning("[RayGun] Loaded. Hold pistol.water and fire – hitscan RayGun using Hurt + HitInfo/OnAttacked.");
+            Puts("[RayGun] Loaded. Hold pistol.water and fire – hitscan RayGun using Hurt + HitInfo/OnAttacked.");
+        }
+
+        private void Unload()
+        {
+            _lastShotTime.Clear();
+        }
+
+        private void OnPlayerDisconnected(BasePlayer player, string reason)
+        {
+            if (player != null)
+                _lastShotTime.Remove(player.userID);
         }
 
         private void SetupPermission()
@@ -199,8 +279,8 @@ namespace Oxide.Plugins
         {
             if (attacker == null) return;
 
-            // Simplified, more typical origin/forward
-            Vector3 origin = attacker.eyes != null
+            // Get eye position for raycast origin (accurate aiming)
+            Vector3 eyePos = attacker.eyes != null
                 ? attacker.eyes.position
                 : attacker.transform.position;
 
@@ -208,12 +288,18 @@ namespace Oxide.Plugins
                 ? attacker.eyes.BodyForward()
                 : attacker.transform.forward;
 
+            // Calculate muzzle position from the held weapon for visual effects
+            Vector3 muzzlePos = GetMuzzlePosition(attacker, eyePos, forward);
+
+            // Apply rotation offset to get the visual effect direction
+            Vector3 effectForward = ApplyRotationOffset(attacker, forward);
+
             RaycastHit hit;
             BaseEntity hitEntity = null;
-            Vector3 hitPoint = origin + forward * _config.MaxRange;
+            Vector3 hitPoint = eyePos + forward * _config.MaxRange;
             Vector3 hitNormal = -forward;
 
-            bool didHit = Physics.Raycast(origin, forward, out hit, _config.MaxRange, _rayMask,
+            bool didHit = Physics.Raycast(eyePos, forward, out hit, _config.MaxRange, _rayMask,
                 QueryTriggerInteraction.Ignore);
 
             if (didHit)
@@ -221,19 +307,6 @@ namespace Oxide.Plugins
                 hitPoint = hit.point;
                 hitNormal = hit.normal;
                 hitEntity = hit.GetEntity();
-
-                if (hitEntity != null)
-                {
-                    PrintWarning($"[RayGun] Raycast hit entity: {hitEntity.ShortPrefabName} ({hitEntity.GetType().Name}) at {hitPoint}");
-                }
-                else
-                {
-                    PrintWarning("[RayGun] Raycast hit something with no BaseEntity");
-                }
-            }
-            else
-            {
-                PrintWarning("[RayGun] Raycast did not hit anything");
             }
 
             bool didDamage = false;
@@ -243,8 +316,18 @@ namespace Oxide.Plugins
                 didDamage = ApplyDamageViaHitInfo(hitEntity, attacker, hitPoint, hitNormal);
             }
 
-            PlayMuzzleFx(origin, forward);
-            PlayTracerFx(origin, hitPoint);
+            // Calculate effect hit point based on rotated direction for visuals
+            Vector3 effectHitPoint = muzzlePos + effectForward * Vector3.Distance(muzzlePos, hitPoint);
+            if (didHit)
+            {
+                // If we actually hit something, use the real hit point for impact
+                effectHitPoint = hitPoint;
+            }
+
+            // Use muzzle position and rotated direction for visual effects
+            PlayMuzzleFx(muzzlePos, effectForward);
+            PlayBeamTracer(muzzlePos, effectHitPoint);
+            PlayProjectileEffect(attacker, muzzlePos, effectHitPoint);
             if (didHit)
                 PlayImpactFx(hitPoint, hitNormal);
 
@@ -253,12 +336,66 @@ namespace Oxide.Plugins
         }
 
         /// <summary>
+        /// Gets the muzzle position from the player's held weapon for visual effects.
+        /// Falls back to a position in front of the player if weapon muzzle can't be found.
+        /// Applies configurable offset adjustments for fine-tuning.
+        /// </summary>
+        private Vector3 GetMuzzlePosition(BasePlayer player, Vector3 eyePos, Vector3 forward)
+        {
+            Vector3 basePos;
+            var heldEntity = player.GetActiveItem()?.GetHeldEntity();
+            
+            // Try to get the muzzle point from BaseProjectile weapons (includes water pistol)
+            // MuzzlePoint may be null for some weapon types or configurations
+            if (heldEntity is BaseProjectile projectile && projectile.MuzzlePoint != null)
+            {
+                basePos = projectile.MuzzlePoint.position;
+            }
+            else
+            {
+                // Fallback: position slightly in front and below eye level (approximate gun position)
+                // This places effects roughly where a held pistol would be
+                Vector3 right = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+                basePos = eyePos + forward * MuzzleOffsetForward - Vector3.up * MuzzleOffsetDown + right * MuzzleOffsetRight;
+            }
+
+            // Apply configurable offset adjustments
+            Vector3 right2 = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+            Vector3 up = Vector3.up;
+            
+            basePos += right2 * _config.MuzzleOffsetX;
+            basePos += up * _config.MuzzleOffsetY;
+            basePos += forward * _config.MuzzleOffsetZ;
+
+            return basePos;
+        }
+
+        /// <summary>
+        /// Applies rotation offset (pitch/yaw) to the forward direction for visual effects.
+        /// </summary>
+        private Vector3 ApplyRotationOffset(BasePlayer player, Vector3 forward)
+        {
+            if (_config.MuzzleRotationPitch == 0f && _config.MuzzleRotationYaw == 0f)
+                return forward;
+
+            Vector3 right = player.eyes != null ? player.eyes.BodyRight() : player.transform.right;
+            Vector3 up = Vector3.up;
+
+            // Apply yaw (left/right rotation around up axis)
+            Quaternion yawRotation = Quaternion.AngleAxis(_config.MuzzleRotationYaw, up);
+            // Apply pitch (up/down rotation around right axis)
+            Quaternion pitchRotation = Quaternion.AngleAxis(_config.MuzzleRotationPitch, right);
+
+            return (yawRotation * pitchRotation * forward).normalized;
+        }
+
+        /// <summary>
         /// Apply damage using BaseCombatEntity.Hurt (like other hitscan weapons),
         /// and also send a HitInfo to OnAttacked so Rust + plugins see a normal hit.
         /// </summary>
         private bool ApplyDamageViaHitInfo(BaseEntity entity, BasePlayer attacker, Vector3 hitPoint, Vector3 hitNormal)
         {
-            if (entity == null || attacker == null) return false;
+            if (entity == null || entity.IsDestroyed || attacker == null) return false;
 
             float dmg = Mathf.Max(0f, _config.Damage);
             if (dmg <= 0f) return false;
@@ -268,60 +405,43 @@ namespace Oxide.Plugins
                 var held = attacker.GetActiveItem()?.GetHeldEntity() as AttackEntity;
                 var bce = entity as BaseCombatEntity;
 
-                PrintWarning($"[RayGun] ApplyDamageViaHitInfo -> target={entity.ShortPrefabName}, type={entity.GetType().Name}, dmg={dmg}");
-
                 // 1) Direct Hurt (this actually changes HP)
                 if (bce != null && !bce.IsDestroyed)
                 {
-                    float before = bce.Health();
-                    bce.Hurt(dmg, _damageType, attacker);
-                    float after = bce.Health();
-                    PrintWarning($"[RayGun] Hurt: {bce.ShortPrefabName} HP {before} -> {after}");
-                }
-                else
-                {
-                    PrintWarning($"[RayGun] Target is not BaseCombatEntity: {entity.ShortPrefabName} ({entity.GetType().Name})");
+                    bce.Hurt(dmg, DamageType, attacker);
                 }
 
                 // 2) Build HitInfo and call OnAttacked
-                var hitInfo = new HitInfo(attacker, entity, _damageType, dmg)
+                Vector3 pointStart = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
+                Vector3 hitDirection = (hitPoint - pointStart);
+                float projectileDistance = hitDirection.magnitude;
+                var hitInfo = new HitInfo(attacker, entity, DamageType, dmg)
                 {
                     Weapon = held,
-                    HitMaterial = StringPool.Get("Flesh"), // general default; Rust doesn’t enforce this hard
-                    DoHitEffects = true
+                    HitMaterial = _fleshMaterialId,
+                    DoHitEffects = true,
+                    HitPositionWorld = hitPoint,
+                    HitNormalWorld = hitNormal,
+                    PointStart = pointStart,
+                    ProjectileID = 0,
+                    ProjectileDistance = projectileDistance,
+                    ProjectileVelocity = (projectileDistance > 0.001f ? hitDirection / projectileDistance : Vector3.forward) * 250f
                 };
 
-                hitInfo.HitPositionWorld = hitPoint;
-                hitInfo.HitNormalWorld = hitNormal;
-                hitInfo.PointStart = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
-                hitInfo.ProjectileID = 0;
-                hitInfo.ProjectileDistance = Vector3.Distance(hitInfo.PointStart, hitPoint);
-                hitInfo.ProjectileVelocity = (hitPoint - hitInfo.PointStart).normalized * 250f;
-
-                // Give it a reasonable bone/area so head/body plugins see it like a normal hit
+                // Give it a reasonable bone so head/body plugins see it like a normal hit
                 if (bce != null)
                 {
-                    hitInfo.boneArea = HitArea.Torso;
-                    hitInfo.HitBone = StringPool.Get("spine1");
+                    hitInfo.HitBone = _spineBoneId;
                 }
 
                 entity.OnAttacked(hitInfo);
-
-                if (bce != null)
-                {
-                    PrintWarning($"[RayGun] Hurt+OnAttacked: {bce.ShortPrefabName}, health now {bce.Health()}");
-                }
-                else
-                {
-                    PrintWarning($"[RayGun] Hurt+OnAttacked: non-combat {entity.ShortPrefabName}");
-                }
 
                 // didDamage only true if we hit something damageable
                 return bce != null;
             }
             catch (Exception e)
             {
-                PrintWarning($"[RayGun] Failed to apply damage to {entity.ShortPrefabName}: {e.Message}");
+                PrintError($"[RayGun] Failed to apply damage to {entity.ShortPrefabName}: {e.Message}");
                 return false;
             }
         }
@@ -334,28 +454,72 @@ namespace Oxide.Plugins
         {
             if (string.IsNullOrEmpty(_config.MuzzleFxPrefab)) return;
 
-            try
+            Effect.server.Run(_config.MuzzleFxPrefab, position, forward);
+        }
+
+        /// <summary>
+        /// Draws a visible colored beam line from origin to hitPoint using DDraw.
+        /// This creates the ray gun laser beam effect visible to all nearby players.
+        /// </summary>
+        private void PlayBeamTracer(Vector3 origin, Vector3 hitPoint)
+        {
+            if (!_config.BeamEnabled) return;
+
+            Color beamColor = new Color(
+                Mathf.Clamp01(_config.BeamColorR),
+                Mathf.Clamp01(_config.BeamColorG),
+                Mathf.Clamp01(_config.BeamColorB),
+                1f
+            );
+
+            float duration = Mathf.Max(0.05f, _config.BeamDuration);
+
+            // Draw the beam line visible to all players
+            foreach (var player in BasePlayer.activePlayerList)
             {
-                Effect.server.Run(_config.MuzzleFxPrefab, position, forward);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play Muzzle FX '{_config.MuzzleFxPrefab}': {e.Message}");
+                if (player == null || player.net?.connection == null) continue;
+
+                // Only send to players within reasonable distance to optimize network traffic
+                float distSqr = (player.transform.position - origin).sqrMagnitude;
+                if (distSqr > 22500f) continue; // 150m radius
+
+                player.SendConsoleCommand("ddraw.line", duration, beamColor, origin, hitPoint);
             }
         }
 
-        private void PlayTracerFx(Vector3 origin, Vector3 hitPoint)
+        /// <summary>
+        /// Creates a traveling projectile effect using the ring effect prefab.
+        /// The effect travels from origin to hitPoint at the configured speed.
+        /// </summary>
+        private void PlayProjectileEffect(BasePlayer attacker, Vector3 origin, Vector3 hitPoint)
         {
-            if (string.IsNullOrEmpty(_config.TracerFxPrefab)) return;
+            if (!_config.ProjectileEnabled || string.IsNullOrEmpty(_config.ProjectilePrefab)) return;
 
-            try
+            Vector3 direction = (hitPoint - origin);
+            float distance = direction.magnitude;
+            if (distance < 0.1f) return;
+
+            direction = direction.normalized;
+            
+            // Apply projectile-specific Z offset
+            Vector3 projectileOrigin = origin + direction * _config.ProjectileOffsetZ;
+            
+            float speed = Mathf.Max(50f, _config.ProjectileSpeed);
+            float travelTime = distance / speed;
+            int steps = Mathf.Clamp(_config.ProjectileCount, 1, 20); // Use configurable count (1-20)
+
+            // Spawn effects along the path with delays to create traveling appearance
+            for (int i = 0; i <= steps; i++)
             {
-                Vector3 direction = (hitPoint - origin).normalized;
-                Effect.server.Run(_config.TracerFxPrefab, origin, direction);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play Tracer FX '{_config.TracerFxPrefab}': {e.Message}");
+                float t = (float)i / steps;
+                Vector3 pos = Vector3.Lerp(projectileOrigin, hitPoint, t);
+                float delay = t * travelTime;
+
+                timer.Once(delay, () =>
+                {
+                    if (attacker == null || attacker.IsDestroyed) return;
+                    Effect.server.Run(_config.ProjectilePrefab, pos, direction);
+                });
             }
         }
 
@@ -363,35 +527,20 @@ namespace Oxide.Plugins
         {
             if (string.IsNullOrEmpty(_config.ImpactFxPrefab)) return;
 
-            try
-            {
-                Vector3 forward = normal.sqrMagnitude > 0.001f ? normal.normalized : Vector3.up;
-                Effect.server.Run(_config.ImpactFxPrefab, position, forward);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play Impact FX '{_config.ImpactFxPrefab}': {e.Message}");
-            }
+            Vector3 forward = normal.sqrMagnitude > 0.001f ? normal.normalized : Vector3.up;
+            Effect.server.Run(_config.ImpactFxPrefab, position, forward);
         }
 
         private void PlayHitmarker(BasePlayer attacker)
         {
-            if (!_config.HitmarkerEnabled) return;
-            if (attacker == null) return;
-            if (string.IsNullOrEmpty(_config.HitmarkerSound)) return;
+            if (!_config.HitmarkerEnabled || attacker == null || string.IsNullOrEmpty(_config.HitmarkerSound))
+                return;
 
-            try
-            {
-                var conn = attacker.net?.connection;
-                if (conn == null) return;
+            var conn = attacker.net?.connection;
+            if (conn == null) return;
 
-                Vector3 pos = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
-                Effect.server.Run(_config.HitmarkerSound, pos, Vector3.up, conn);
-            }
-            catch (Exception e)
-            {
-                PrintWarning($"[RayGun] Failed to play hitmarker sound '{_config.HitmarkerSound}': {e.Message}");
-            }
+            Vector3 pos = attacker.eyes != null ? attacker.eyes.position : attacker.transform.position;
+            Effect.server.Run(_config.HitmarkerSound, pos, Vector3.up, conn);
         }
 
         #endregion
@@ -424,6 +573,17 @@ namespace Oxide.Plugins
                 ? "(none / disabled)"
                 : $"'{_config.HitmarkerSound}'";
 
+            string beamInfo = _config.BeamEnabled 
+                ? $"ON (R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}, {_config.BeamDuration:F2}s)"
+                : "OFF";
+
+            string projectileInfo = _config.ProjectileEnabled
+                ? $"ON (Speed:{_config.ProjectileSpeed:F0}, Count:{_config.ProjectileCount}, Offset:{_config.ProjectileOffsetZ:F2})"
+                : "OFF";
+
+            string offsetInfo = $"X:{_config.MuzzleOffsetX:F2} Y:{_config.MuzzleOffsetY:F2} Z:{_config.MuzzleOffsetZ:F2}";
+            string rotationInfo = $"Pitch:{_config.MuzzleRotationPitch:F1}° Yaw:{_config.MuzzleRotationYaw:F1}°";
+
             player.ChatMessage(
                 "RayGun Info:\n" +
                 $"- Enabled: {(_config.Enabled ? "YES" : "NO")}\n" +
@@ -434,9 +594,367 @@ namespace Oxide.Plugins
                 $"- Permission: {permission}\n" +
                 $"- Hitmarker: {hitmarkerState} (sound: {hitmarkerSound})\n" +
                 $"- MuzzleFx: '{_config.MuzzleFxPrefab}'\n" +
-                $"- TracerFx: '{_config.TracerFxPrefab}'\n" +
+                $"- Beam: {beamInfo}\n" +
+                $"- Projectile: {projectileInfo}\n" +
+                $"- MuzzleOffset: {offsetInfo}\n" +
+                $"- MuzzleRotation: {rotationInfo}\n" +
                 $"- ImpactFx: '{_config.ImpactFxPrefab}'"
             );
+        }
+
+        [ChatCommand("raygun.offset")]
+        private void CmdRayGunOffset(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Muzzle Offset Adjustment:\n" +
+                    $"Current: X:{_config.MuzzleOffsetX:F2} Y:{_config.MuzzleOffsetY:F2} Z:{_config.MuzzleOffsetZ:F2}\n" +
+                    "Commands:\n" +
+                    "  /raygun.offset x <value> - Set X offset (right/left)\n" +
+                    "  /raygun.offset y <value> - Set Y offset (up/down)\n" +
+                    "  /raygun.offset z <value> - Set Z offset (forward/back)\n" +
+                    "  /raygun.offset reset - Reset all offsets to 0\n" +
+                    "D-Pad Style:\n" +
+                    "  /raygun.offset left - Move X -0.05\n" +
+                    "  /raygun.offset right - Move X +0.05\n" +
+                    "  /raygun.offset up - Move Y +0.05\n" +
+                    "  /raygun.offset down - Move Y -0.05\n" +
+                    "  /raygun.offset forward - Move Z +0.05\n" +
+                    "  /raygun.offset back - Move Z -0.05"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+            float step = OffsetStepSize;
+
+            switch (action)
+            {
+                case "x":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float xVal))
+                    {
+                        _config.MuzzleOffsetX = xVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle X offset set to {_config.MuzzleOffsetX:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.offset x <value>");
+                    break;
+
+                case "y":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float yVal))
+                    {
+                        _config.MuzzleOffsetY = yVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle Y offset set to {_config.MuzzleOffsetY:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.offset y <value>");
+                    break;
+
+                case "z":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float zVal))
+                    {
+                        _config.MuzzleOffsetZ = zVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle Z offset set to {_config.MuzzleOffsetZ:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.offset z <value>");
+                    break;
+
+                case "reset":
+                    _config.MuzzleOffsetX = 0f;
+                    _config.MuzzleOffsetY = 0f;
+                    _config.MuzzleOffsetZ = 0f;
+                    SaveConfig();
+                    player.ChatMessage("Muzzle offsets reset to 0.");
+                    break;
+
+                // D-Pad style adjustments
+                case "left":
+                    _config.MuzzleOffsetX -= step;
+                    SaveConfig();
+                    player.ChatMessage($"X: {_config.MuzzleOffsetX:F2} (moved left)");
+                    break;
+
+                case "right":
+                    _config.MuzzleOffsetX += step;
+                    SaveConfig();
+                    player.ChatMessage($"X: {_config.MuzzleOffsetX:F2} (moved right)");
+                    break;
+
+                case "up":
+                    _config.MuzzleOffsetY += step;
+                    SaveConfig();
+                    player.ChatMessage($"Y: {_config.MuzzleOffsetY:F2} (moved up)");
+                    break;
+
+                case "down":
+                    _config.MuzzleOffsetY -= step;
+                    SaveConfig();
+                    player.ChatMessage($"Y: {_config.MuzzleOffsetY:F2} (moved down)");
+                    break;
+
+                case "forward":
+                    _config.MuzzleOffsetZ += step;
+                    SaveConfig();
+                    player.ChatMessage($"Z: {_config.MuzzleOffsetZ:F2} (moved forward)");
+                    break;
+
+                case "back":
+                    _config.MuzzleOffsetZ -= step;
+                    SaveConfig();
+                    player.ChatMessage($"Z: {_config.MuzzleOffsetZ:F2} (moved back)");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.offset for help.");
+                    break;
+            }
+        }
+
+        [ChatCommand("raygun.rotation")]
+        private void CmdRayGunRotation(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            float rotationStep = 5f; // 5 degrees per step
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Muzzle Rotation Adjustment:\n" +
+                    $"Current: Pitch:{_config.MuzzleRotationPitch:F1}° Yaw:{_config.MuzzleRotationYaw:F1}°\n" +
+                    "Commands:\n" +
+                    "  /raygun.rotation pitch <degrees> - Set pitch (up/down angle)\n" +
+                    "  /raygun.rotation yaw <degrees> - Set yaw (left/right angle)\n" +
+                    "  /raygun.rotation reset - Reset all rotations to 0\n" +
+                    "D-Pad Style (5° per step):\n" +
+                    "  /raygun.rotation pitchup - Pitch up +5°\n" +
+                    "  /raygun.rotation pitchdown - Pitch down -5°\n" +
+                    "  /raygun.rotation yawleft - Yaw left -5°\n" +
+                    "  /raygun.rotation yawright - Yaw right +5°"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+
+            switch (action)
+            {
+                case "pitch":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float pitchVal))
+                    {
+                        _config.MuzzleRotationPitch = pitchVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle pitch set to {_config.MuzzleRotationPitch:F1}°");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.rotation pitch <degrees>");
+                    break;
+
+                case "yaw":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float yawVal))
+                    {
+                        _config.MuzzleRotationYaw = yawVal;
+                        SaveConfig();
+                        player.ChatMessage($"Muzzle yaw set to {_config.MuzzleRotationYaw:F1}°");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.rotation yaw <degrees>");
+                    break;
+
+                case "reset":
+                    _config.MuzzleRotationPitch = 0f;
+                    _config.MuzzleRotationYaw = 0f;
+                    SaveConfig();
+                    player.ChatMessage("Muzzle rotations reset to 0.");
+                    break;
+
+                // D-Pad style adjustments
+                case "pitchup":
+                    _config.MuzzleRotationPitch += rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Pitch: {_config.MuzzleRotationPitch:F1}° (tilted up)");
+                    break;
+
+                case "pitchdown":
+                    _config.MuzzleRotationPitch -= rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Pitch: {_config.MuzzleRotationPitch:F1}° (tilted down)");
+                    break;
+
+                case "yawleft":
+                    _config.MuzzleRotationYaw -= rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Yaw: {_config.MuzzleRotationYaw:F1}° (turned left)");
+                    break;
+
+                case "yawright":
+                    _config.MuzzleRotationYaw += rotationStep;
+                    SaveConfig();
+                    player.ChatMessage($"Yaw: {_config.MuzzleRotationYaw:F1}° (turned right)");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.rotation for help.");
+                    break;
+            }
+        }
+
+        [ChatCommand("raygun.beam")]
+        private void CmdRayGunBeam(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Beam Settings:\n" +
+                    $"Enabled: {_config.BeamEnabled}\n" +
+                    $"Color: R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}\n" +
+                    $"Duration: {_config.BeamDuration:F2}s\n" +
+                    "Commands:\n" +
+                    "  /raygun.beam toggle - Toggle beam on/off\n" +
+                    "  /raygun.beam color <r> <g> <b> - Set RGB color (0-1)\n" +
+                    "  /raygun.beam duration <seconds> - Set duration"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+
+            switch (action)
+            {
+                case "toggle":
+                    _config.BeamEnabled = !_config.BeamEnabled;
+                    SaveConfig();
+                    player.ChatMessage($"Beam is now {(_config.BeamEnabled ? "ENABLED" : "DISABLED")}");
+                    break;
+
+                case "color":
+                    if (args.Length >= 4 &&
+                        float.TryParse(args[1], out float r) &&
+                        float.TryParse(args[2], out float g) &&
+                        float.TryParse(args[3], out float b))
+                    {
+                        _config.BeamColorR = Mathf.Clamp01(r);
+                        _config.BeamColorG = Mathf.Clamp01(g);
+                        _config.BeamColorB = Mathf.Clamp01(b);
+                        SaveConfig();
+                        player.ChatMessage($"Beam color set to R:{_config.BeamColorR:F1} G:{_config.BeamColorG:F1} B:{_config.BeamColorB:F1}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.beam color <r> <g> <b> (values 0-1)");
+                    break;
+
+                case "duration":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float dur))
+                    {
+                        _config.BeamDuration = Mathf.Max(0.05f, dur);
+                        SaveConfig();
+                        player.ChatMessage($"Beam duration set to {_config.BeamDuration:F2}s");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.beam duration <seconds>");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.beam for help.");
+                    break;
+            }
+        }
+
+        [ChatCommand("raygun.projectile")]
+        private void CmdRayGunProjectile(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !player.IsAdmin)
+            {
+                player?.ChatMessage("Admin only command.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                player.ChatMessage(
+                    "RayGun Projectile Settings:\n" +
+                    $"Enabled: {_config.ProjectileEnabled}\n" +
+                    $"Speed: {_config.ProjectileSpeed:F0} m/s\n" +
+                    $"Count: {_config.ProjectileCount} rings\n" +
+                    $"Offset Z: {_config.ProjectileOffsetZ:F2}\n" +
+                    $"Prefab: '{_config.ProjectilePrefab}'\n" +
+                    "Commands:\n" +
+                    "  /raygun.projectile toggle - Toggle projectile effect on/off\n" +
+                    "  /raygun.projectile speed <value> - Set projectile speed (m/s)\n" +
+                    "  /raygun.projectile count <1-20> - Set number of ring effects\n" +
+                    "  /raygun.projectile offset <value> - Set Z offset (negative = back)"
+                );
+                return;
+            }
+
+            string action = args[0].ToLower();
+
+            switch (action)
+            {
+                case "toggle":
+                    _config.ProjectileEnabled = !_config.ProjectileEnabled;
+                    SaveConfig();
+                    player.ChatMessage($"Projectile effect is now {(_config.ProjectileEnabled ? "ENABLED" : "DISABLED")}");
+                    break;
+
+                case "speed":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float spd))
+                    {
+                        _config.ProjectileSpeed = Mathf.Max(50f, spd);
+                        SaveConfig();
+                        player.ChatMessage($"Projectile speed set to {_config.ProjectileSpeed:F0} m/s");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.projectile speed <value>");
+                    break;
+
+                case "count":
+                    if (args.Length >= 2 && int.TryParse(args[1], out int cnt))
+                    {
+                        _config.ProjectileCount = Mathf.Clamp(cnt, 1, 20);
+                        SaveConfig();
+                        player.ChatMessage($"Projectile count set to {_config.ProjectileCount} rings (more spread out)");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.projectile count <1-20>");
+                    break;
+
+                case "offset":
+                    if (args.Length >= 2 && float.TryParse(args[1], out float off))
+                    {
+                        _config.ProjectileOffsetZ = off;
+                        SaveConfig();
+                        player.ChatMessage($"Projectile Z offset set to {_config.ProjectileOffsetZ:F2}");
+                    }
+                    else
+                        player.ChatMessage("Usage: /raygun.projectile offset <value>");
+                    break;
+
+                default:
+                    player.ChatMessage($"Unknown action '{action}'. Use /raygun.projectile for help.");
+                    break;
+            }
         }
 
         #endregion
